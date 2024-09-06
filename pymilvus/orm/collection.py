@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Union
 
 import pandas as pd
 
-from pymilvus.client import entity_helper, utils
+from pymilvus.client import utils
 from pymilvus.client.abstract import BaseRanker, SearchResult
 from pymilvus.client.constants import DEFAULT_CONSISTENCY_LEVEL
 from pymilvus.client.types import (
@@ -34,7 +34,6 @@ from pymilvus.exceptions import (
     IndexNotExistException,
     PartitionAlreadyExistException,
     SchemaNotReadyException,
-    UpsertAutoIDTrueException,
 )
 from pymilvus.grpc_gen import schema_pb2
 from pymilvus.settings import Config
@@ -347,7 +346,9 @@ class Collection:
 
         Args:
             properties (``dict``): collection properties.
-                 only support collection TTL with key `collection.ttl.seconds`
+                 support collection TTL with key `collection.ttl.seconds`
+                 support collection replica number with key `collection.replica.number`
+                 support collection resource groups with key `collection.resource_groups`.
             timeout (float, optional): an optional duration of time in seconds to allow
                 for the RPCs. If timeout is not set, the client keeps waiting until the
                 server responds or an error occurs.
@@ -373,7 +374,7 @@ class Collection:
     def load(
         self,
         partition_names: Optional[list] = None,
-        replica_number: int = 1,
+        replica_number: int = 0,
         timeout: Optional[float] = None,
         **kwargs,
     ):
@@ -390,10 +391,14 @@ class Collection:
                 * *_async*(``bool``)
                     Indicate if invoke asynchronously.
 
-                * *_refresh*(``bool``)
+                * *refresh*(``bool``)
                     Whether to renew the segment list of this collection before loading
-                * *_resource_groups(``List[str]``)
+                * *resource_groups(``List[str]``)
                     Specify resource groups which can be used during loading.
+                * *load_fields(``List[str]``)
+                    Specify load fields list needed during this load
+                * *_skip_load_dynamic_field(``bool``)
+                    Specify whether this load shall skip dynamic schmea field
 
         Raises:
             MilvusException: If anything goes wrong.
@@ -509,7 +514,7 @@ class Collection:
             )
 
         check_insert_schema(self.schema, data)
-        entities = Prepare.prepare_insert_data(data, self.schema)
+        entities = Prepare.prepare_data(data, self.schema)
         return conn.batch_insert(
             self._name,
             entities,
@@ -620,9 +625,6 @@ class Collection:
             10
         """
 
-        if self.schema.auto_id:
-            raise UpsertAutoIDTrueException(message=ExceptionsMessage.UpsertAutoIDTrue)
-
         if not is_valid_insert_data(data):
             raise DataTypeNotSupportException(
                 message="The type of data should be List, pd.DataFrame or Dict"
@@ -641,7 +643,7 @@ class Collection:
             return MutationResult(res)
 
         check_upsert_schema(self.schema, data)
-        entities = Prepare.prepare_upsert_data(data, self.schema)
+        entities = Prepare.prepare_data(data, self.schema, False)
         res = conn.upsert(
             self._name,
             entities,
@@ -969,10 +971,6 @@ class Collection:
         round_decimal: int = -1,
         **kwargs,
     ):
-        if entity_helper.entity_is_sparse_matrix(data):
-            # search iterator is based on range_search, which is not yet supported for sparse.
-            raise DataTypeNotSupportException(message=ExceptionsMessage.DataTypeNotSupport)
-
         if expr is not None and not isinstance(expr, str):
             raise DataTypeNotMatchException(message=ExceptionsMessage.ExprType % type(expr))
         return SearchIterator(
@@ -1320,6 +1318,10 @@ class Collection:
         if tmp_index is not None:
             field_name = tmp_index.pop("field_name", None)
             index_name = tmp_index.pop("index_name", index_name)
+            tmp_index.pop("total_rows")
+            tmp_index.pop("indexed_rows")
+            tmp_index.pop("pending_index_rows")
+            tmp_index.pop("state")
             return Index(self, field_name, tmp_index, construct_only=True, index_name=index_name)
         raise IndexNotExistException(message=ExceptionsMessage.IndexNotExist)
 
@@ -1442,9 +1444,10 @@ class Collection:
         conn = self._get_connection()
         copy_kwargs = copy.deepcopy(kwargs)
         index_name = copy_kwargs.pop("index_name", Config.IndexName)
-        if conn.describe_index(self._name, index_name, timeout=timeout, **copy_kwargs) is None:
-            return False
-        return True
+
+        return (
+            conn.describe_index(self._name, index_name, timeout=timeout, **copy_kwargs) is not None
+        )
 
     def drop_index(self, timeout: Optional[float] = None, **kwargs):
         """Drop index and its corresponding index files.
@@ -1480,16 +1483,17 @@ class Collection:
         conn = self._get_connection()
         tmp_index = conn.describe_index(self._name, index_name, timeout=timeout, **copy_kwargs)
         if tmp_index is not None:
-            index = Index(
-                collection=self,
+            conn.drop_index(
+                collection_name=self._name,
                 field_name=tmp_index["field_name"],
-                index_params=tmp_index,
-                construct_only=True,
                 index_name=index_name,
+                timeout=timeout,
+                **copy_kwargs,
             )
-            index.drop(timeout=timeout, **kwargs)
 
-    def compact(self, timeout: Optional[float] = None, is_major: Optional[bool] = False, **kwargs):
+    def compact(
+        self, is_clustering: Optional[bool] = False, timeout: Optional[float] = None, **kwargs
+    ):
         """Compact merge the small segments in a collection
 
         Args:
@@ -1497,23 +1501,23 @@ class Collection:
                 for the RPC. When timeout is set to None, client waits until server response
                 or error occur.
 
-            is_major (``bool``, optional): An optional setting to trigger major compaction.
+            is_clustering (``bool``, optional): Option to trigger clustering compaction.
 
         Raises:
             MilvusException: If anything goes wrong.
         """
         conn = self._get_connection()
-        if is_major:
-            self.major_compaction_id = conn.compact(
-                self._name, timeout=timeout, is_major=is_major, **kwargs
+        if is_clustering:
+            self.clustering_compaction_id = conn.compact(
+                self._name, is_clustering=is_clustering, timeout=timeout, **kwargs
             )
         else:
             self.compaction_id = conn.compact(
-                self._name, timeout=timeout, is_major=is_major, **kwargs
+                self._name, is_clustering=is_clustering, timeout=timeout, **kwargs
             )
 
     def get_compaction_state(
-        self, timeout: Optional[float] = None, is_major: Optional[bool] = False, **kwargs
+        self, timeout: Optional[float] = None, is_clustering: Optional[bool] = False, **kwargs
     ) -> CompactionState:
         """Get the current compaction state
 
@@ -1522,20 +1526,22 @@ class Collection:
                 for the RPC. When timeout is set to None, client waits until server response
                 or error occur.
 
-            is_major (``bool``, optional): An optional setting to get major compaction state.
+            is_clustering (``bool``, optional): Option to get clustering compaction state.
 
         Raises:
             MilvusException: If anything goes wrong.
         """
         conn = self._get_connection()
-        if is_major:
-            return conn.get_compaction_state(self.major_compaction_id, timeout=timeout, **kwargs)
+        if is_clustering:
+            return conn.get_compaction_state(
+                self.clustering_compaction_id, timeout=timeout, **kwargs
+            )
         return conn.get_compaction_state(self.compaction_id, timeout=timeout, **kwargs)
 
     def wait_for_compaction_completed(
         self,
         timeout: Optional[float] = None,
-        is_major: Optional[bool] = False,
+        is_clustering: Optional[bool] = False,
         **kwargs,
     ) -> CompactionState:
         """Block until the current collection's compaction completed
@@ -1545,15 +1551,15 @@ class Collection:
                 for the RPC. When timeout is set to None, client waits until server response
                 or error occur.
 
-            is_major (``bool``, optional): An optional setting to get major compaction state.
+            is_clustering (``bool``, optional): Option to get clustering compaction state.
 
         Raises:
             MilvusException: If anything goes wrong.
         """
         conn = self._get_connection()
-        if is_major:
+        if is_clustering:
             return conn.wait_for_compaction_completed(
-                self.major_compaction_id, timeout=timeout, **kwargs
+                self.clustering_compaction_id, timeout=timeout, **kwargs
             )
         return conn.wait_for_compaction_completed(self.compaction_id, timeout=timeout, **kwargs)
 

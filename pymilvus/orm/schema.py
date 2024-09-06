@@ -14,7 +14,7 @@ import copy
 from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
-from pandas.api.types import is_list_like
+from pandas.api.types import is_list_like, is_scalar
 
 from pymilvus.exceptions import (
     AutoIDException,
@@ -25,15 +25,17 @@ from pymilvus.exceptions import (
     ExceptionsMessage,
     FieldsTypeException,
     FieldTypeException,
+    ParamError,
     PartitionKeyException,
     PrimaryKeyException,
     SchemaNotReadyException,
-    UpsertAutoIDTrueException,
 )
+from pymilvus.grpc_gen import schema_pb2 as schema_types
 
 from .constants import COMMON_TYPE_PARAMS
 from .types import (
     DataType,
+    infer_dtype_by_scalar_data,
     infer_dtype_bydata,
     map_numpy_dtype_to_datatype,
 )
@@ -63,12 +65,8 @@ def validate_partition_key(
         )
 
 
-def validate_clustering_key(
-    clustering_key_field_name: Any, clustering_key_field: Any, primary_field_name: Any
-):
+def validate_clustering_key(clustering_key_field_name: Any, clustering_key_field: Any):
     if clustering_key_field is not None:
-        if clustering_key_field.name == primary_field_name:
-            raise ClusteringKeyException(message=ExceptionsMessage.ClusteringKeyNotPrimary)
         if clustering_key_field.dtype not in [
             DataType.INT8,
             DataType.INT16,
@@ -82,7 +80,7 @@ def validate_clustering_key(
             raise ClusteringKeyException(message=ExceptionsMessage.ClusteringKeyType)
     elif clustering_key_field_name is not None:
         raise ClusteringKeyException(
-            message=ExceptionsMessage.PartitionKeyFieldNotExist % clustering_key_field_name
+            message=ExceptionsMessage.ClusteringKeyFieldNotExist % clustering_key_field_name
         )
 
 
@@ -171,9 +169,7 @@ class CollectionSchema:
         validate_partition_key(
             partition_key_field_name, self._partition_key_field, self._primary_field.name
         )
-        validate_clustering_key(
-            clustering_key_field_name, self._clustering_key_field, self._primary_field.name
-        )
+        validate_clustering_key(clustering_key_field_name, self._clustering_key_field)
 
         auto_id = self._kwargs.get("auto_id", False)
         if auto_id:
@@ -311,6 +307,7 @@ class FieldSchema:
             raise PrimaryKeyException(message=ExceptionsMessage.IsPrimaryType)
         self.is_primary = kwargs.get("is_primary", False)
         self.is_dynamic = kwargs.get("is_dynamic", False)
+        self.nullable = kwargs.get("nullable", False)
         self.auto_id = kwargs.get("auto_id", False)
         if "auto_id" in kwargs:
             if not isinstance(self.auto_id, bool):
@@ -324,7 +321,17 @@ class FieldSchema:
             raise ClusteringKeyException(message=ExceptionsMessage.IsClusteringKeyType)
         self.is_partition_key = kwargs.get("is_partition_key", False)
         self.is_clustering_key = kwargs.get("is_clustering_key", False)
+        self.default_value = kwargs.get("default_value", None)
+        if "default_value" in kwargs and self.default_value is None and not self.nullable:
+            raise ParamError(message=ExceptionsMessage.DefaultValueInvalid)
+        if isinstance(self.default_value, schema_types.ValueField):
+            if self.default_value.WhichOneof("data") is None:
+                self.default_value = None
+        else:
+            self.default_value = infer_default_value_bydata(kwargs.get("default_value", None))
         self.element_type = kwargs.get("element_type", None)
+        if "mmap_enabled" in kwargs:
+            self._type_params["mmap_enabled"] = kwargs["mmap_enabled"]
         self._parse_type_params()
 
     def __repr__(self) -> str:
@@ -366,7 +373,10 @@ class FieldSchema:
             kwargs["auto_id"] = raw.get("auto_id")
         kwargs["is_partition_key"] = raw.get("is_partition_key", False)
         kwargs["is_clustering_key"] = raw.get("is_clustering_key", False)
+        if raw.get("default_value") is not None:
+            kwargs["default_value"] = raw.get("default_value")
         kwargs["is_dynamic"] = raw.get("is_dynamic", False)
+        kwargs["nullable"] = raw.get("nullable", False)
         kwargs["element_type"] = raw.get("element_type")
         return FieldSchema(raw["name"], raw["type"], raw.get("description", ""), **kwargs)
 
@@ -383,8 +393,14 @@ class FieldSchema:
             _dict["auto_id"] = self.auto_id
         if self.is_partition_key:
             _dict["is_partition_key"] = True
+        if self.default_value is not None:
+            if self.default_value.WhichOneof("data") is None:
+                self.default_value = None
+            _dict["default_value"] = self.default_value
         if self.is_dynamic:
             _dict["is_dynamic"] = self.is_dynamic
+        if self.nullable:
+            _dict["nullable"] = self.nullable
         if self.dtype == DataType.ARRAY and self.element_type:
             _dict["element_type"] = self.element_type
         if self.is_clustering_key:
@@ -485,13 +501,8 @@ def _check_insert_data(data: Union[List[List], pd.DataFrame]):
             raise DataTypeNotSupportException(message="data should be a list of list")
 
 
-def _check_data_schema_cnt(schema: CollectionSchema, data: Union[List[List], pd.DataFrame]):
-    tmp_fields = copy.deepcopy(schema.fields)
-    for i, field in enumerate(tmp_fields):
-        if field.is_primary and field.auto_id:
-            tmp_fields.pop(i)
-
-    field_cnt = len(tmp_fields)
+def _check_data_schema_cnt(fields: List, data: Union[List[List], pd.DataFrame]):
+    field_cnt = len(fields)
     is_dataframe = isinstance(data, pd.DataFrame)
     data_cnt = len(data.columns) if is_dataframe else len(data)
     if field_cnt != data_cnt:
@@ -499,14 +510,14 @@ def _check_data_schema_cnt(schema: CollectionSchema, data: Union[List[List], pd.
             f"The data don't match with schema fields, expect {field_cnt} list, got {len(data)}"
         )
         if is_dataframe:
-            i_name = [f.name for f in tmp_fields]
+            i_name = [f.name for f in fields]
             t_name = list(data.columns)
             message = f"The fields don't match with schema fields, expected: {i_name}, got {t_name}"
 
         raise DataNotMatchException(message=message)
 
     if is_dataframe:
-        for x, y in zip(list(data.columns), tmp_fields):
+        for x, y in zip(list(data.columns), fields):
             if x != y.name:
                 raise DataNotMatchException(
                     message=f"The name of field don't match, expected: {y.name}, got {x}"
@@ -522,19 +533,27 @@ def check_insert_schema(schema: CollectionSchema, data: Union[List[List], pd.Dat
             raise DataNotMatchException(message=msg)
         columns = list(data.columns)
         columns.remove(schema.primary_field)
-        data = data[[columns]]
+        data = data[columns]
 
-    _check_data_schema_cnt(schema, data)
+    tmp_fields = copy.deepcopy(schema.fields)
+    for i, field in enumerate(tmp_fields):
+        if field.is_primary and field.auto_id:
+            tmp_fields.pop(i)
+
+    _check_data_schema_cnt(tmp_fields, data)
     _check_insert_data(data)
 
 
 def check_upsert_schema(schema: CollectionSchema, data: Union[List[List], pd.DataFrame]):
     if schema is None:
         raise SchemaNotReadyException(message="Schema shouldn't be None")
-    if schema.auto_id:
-        raise UpsertAutoIDTrueException(message=ExceptionsMessage.UpsertAutoIDTrue)
+    if isinstance(data, pd.DataFrame):
+        if schema.primary_field.name not in data or data[schema.primary_field.name].isnull().all():
+            raise DataNotMatchException(message=ExceptionsMessage.UpsertPrimaryKeyEmpty)
+        columns = list(data.columns)
+        data = data[columns]
 
-    _check_data_schema_cnt(schema, data)
+    _check_data_schema_cnt(copy.deepcopy(schema.fields), data)
     _check_insert_data(data)
 
 
@@ -603,3 +622,27 @@ def check_schema(schema: CollectionSchema):
             vector_fields.append(field.name)
     if len(vector_fields) < 1:
         raise SchemaNotReadyException(message=ExceptionsMessage.NoVector)
+
+
+def infer_default_value_bydata(data: Any):
+    if data is None:
+        return None
+    default_data = schema_types.ValueField()
+    d_type = DataType.UNKNOWN
+    if is_scalar(data):
+        d_type = infer_dtype_by_scalar_data(data)
+    if d_type is DataType.BOOL:
+        default_data.bool_data = data
+    elif d_type in (DataType.INT8, DataType.INT16, DataType.INT32):
+        default_data.int_data = data
+    elif d_type is DataType.INT64:
+        default_data.long_data = data
+    elif d_type is DataType.FLOAT:
+        default_data.float_data = data
+    elif d_type is DataType.DOUBLE:
+        default_data.double_data = data
+    elif d_type is DataType.VARCHAR:
+        default_data.string_data = data
+    else:
+        raise ParamError(message=f"Default value unsupported data type: {d_type}")
+    return default_data

@@ -141,10 +141,6 @@ class InvalidConsistencyLevel(MilvusException):
     """Raise when consistency level is invalid"""
 
 
-class UpsertAutoIDTrueException(MilvusException):
-    """Raise when upsert autoID is true"""
-
-
 class ExceptionsMessage:
     NoHostPort = "connection configuration must contain 'host' and 'port'."
     HostType = "Type of 'host' must be str."
@@ -198,6 +194,7 @@ class ExceptionsMessage:
     DataTypeInconsistent = (
         "The Input data type is inconsistent with defined schema, please check it."
     )
+    FieldDataInconsistent = "The Input data type is inconsistent with defined schema, {%s} field should be a %s, but got a {%s} instead."
     DataTypeNotSupport = "Data type is not support."
     DataLengthsInconsistent = "Arrays must all be same length."
     DataFrameInvalid = "Cannot infer schema from empty dataframe."
@@ -213,7 +210,7 @@ class ExceptionsMessage:
     EnvConfigErr = "Environment variable %s has a wrong format, please check it: %s"
     AmbiguousIndexName = "There are multiple indexes, please specify the index_name."
     InsertUnexpectedField = (
-        "Attempt to insert an unexpected field to collection without enabling dynamic field"
+        "Attempt to insert an unexpected field `%s` to collection without enabling dynamic field"
     )
     UpsertAutoIDTrue = "Upsert don't support autoid == true"
     AmbiguousDeleteFilterParam = (
@@ -223,7 +220,6 @@ class ExceptionsMessage:
         "Ambiguous parameter, either ids or filter should be specified, cannot support both."
     )
     JSONKeyMustBeStr = "JSON key must be str."
-    ClusteringKeyNotPrimary = "Clustering key field should not be primary field"
     ClusteringKeyType = (
         "Clustering key field type must be DataType.INT8, DataType.INT16, "
         "DataType.INT32, DataType.INT64, DataType.FLOAT, DataType.DOUBLE, "
@@ -233,3 +229,7 @@ class ExceptionsMessage:
     ClusteringKeyOnlyOne = "Expected only one clustering key field, got [%s, %s, ...]."
     IsClusteringKeyType = "Param is_clustering_key must be bool type."
     ClusteringKeyFieldType = "Param clustering_key_field must be str type."
+    UpsertPrimaryKeyEmpty = "Upsert need to assign pk."
+    DefaultValueInvalid = (
+        "Default value cannot be None for a field that is defined as nullable == false."
+    )

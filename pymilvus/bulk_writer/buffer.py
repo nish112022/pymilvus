@@ -10,9 +10,11 @@
 # or implied. See the License for the specific language governing permissions and limitations under
 # the License.
 
+import csv
 import json
 import logging
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -42,10 +44,12 @@ class Buffer:
         self,
         schema: CollectionSchema,
         file_type: BulkFileType = BulkFileType.NUMPY,
+        config: Optional[dict] = None,
     ):
         self._buffer = {}
         self._fields = {}
         self._file_type = file_type
+        self._config = config or {}
         for field in schema.fields:
             if field.is_primary and field.auto_id:
                 continue
@@ -120,6 +124,8 @@ class Buffer:
             return self._persist_json_rows(local_path, **kwargs)
         if self._file_type == BulkFileType.PARQUET:
             return self._persist_parquet(local_path, **kwargs)
+        if self._file_type == BulkFileType.CSV:
+            return self._persist_csv(local_path, **kwargs)
 
         self._throw(f"Unsupported file tpye: {self._file_type}")
         return []
@@ -149,7 +155,22 @@ class Buffer:
                         str_arr.append(json.dumps(val))
                     self._buffer[k] = str_arr
 
-                arr = np.array(self._buffer[k], dtype=dt)
+                # currently, milvus server doesn't support numpy for sparse vector
+                if field_schema.dtype == DataType.SPARSE_FLOAT_VECTOR:
+                    self._throw(
+                        f"Failed to persist file {full_file_name},"
+                        f" error: milvus doesn't support parsing sparse vectors from numpy file"
+                    )
+
+                # special process for float16 vector, the self._buffer stores bytes for
+                # float16 vector, convert the bytes to uint8 array
+                if field_schema.dtype in {DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR}:
+                    a = []
+                    for b in self._buffer[k]:
+                        a.append(np.frombuffer(b, dtype=dt).tolist())
+                    arr = np.array(a, dtype=dt)
+                else:
+                    arr = np.array(self._buffer[k], dtype=dt)
                 np.save(str(full_file_name), arr)
             except Exception as e:
                 self._throw(f"Failed to persist file {full_file_name}, error: {e}")
@@ -173,7 +194,18 @@ class Buffer:
         while row_index < row_count:
             row = {}
             for k, v in self._buffer.items():
-                row[k] = v[row_index]
+                # special process for float16 vector, the self._buffer stores bytes for
+                # float16 vector, convert the bytes to float list
+                field_schema = self._fields[k]
+                if field_schema.dtype in {DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR}:
+                    dt = (
+                        np.dtype("bfloat16")
+                        if (field_schema.dtype == DataType.BFLOAT16_VECTOR)
+                        else np.float16
+                    )
+                    row[k] = np.frombuffer(v[row_index], dtype=dt).tolist()
+                else:
+                    row[k] = v[row_index]
             rows.append(row)
             row_index = row_index + 1
 
@@ -196,21 +228,25 @@ class Buffer:
         data = {}
         for k in self._buffer:
             field_schema = self._fields[k]
-            if field_schema.dtype == DataType.JSON:
-                # for JSON field, store as string array
+            if field_schema.dtype in {DataType.JSON, DataType.SPARSE_FLOAT_VECTOR}:
+                # for JSON and SPARSE_VECTOR field, store as string array
                 str_arr = []
                 for val in self._buffer[k]:
                     str_arr.append(json.dumps(val))
                 data[k] = pd.Series(str_arr, dtype=None)
-            elif field_schema.dtype == DataType.FLOAT_VECTOR:
+            elif field_schema.dtype in {DataType.BINARY_VECTOR, DataType.FLOAT_VECTOR}:
                 arr = []
                 for val in self._buffer[k]:
-                    arr.append(np.array(val, dtype=np.dtype("float32")))
+                    arr.append(np.array(val, dtype=NUMPY_TYPE_CREATOR[field_schema.dtype.name]))
                 data[k] = pd.Series(arr)
-            elif field_schema.dtype == DataType.BINARY_VECTOR:
+            elif field_schema.dtype in {DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR}:
+                # special process for float16 vector, the self._buffer stores bytes for
+                # float16 vector, convert the bytes to uint8 array
                 arr = []
                 for val in self._buffer[k]:
-                    arr.append(np.array(val, dtype=np.dtype("uint8")))
+                    arr.append(
+                        np.frombuffer(val, dtype=NUMPY_TYPE_CREATOR[field_schema.dtype.name])
+                    )
                 data[k] = pd.Series(arr)
             elif field_schema.dtype == DataType.ARRAY:
                 dt = NUMPY_TYPE_CREATOR[field_schema.element_type.name]
@@ -237,10 +273,8 @@ class Buffer:
             buffer_row_count = kwargs.get("buffer_row_count", 1)
             size_per_row = int(buffer_size / buffer_row_count) + 1
             row_group_size = int(row_group_bytes / size_per_row)
-            if row_group_size < row_group_size_min:
-                row_group_size = row_group_size_min
-            if row_group_size > row_group_size_max:
-                row_group_size = row_group_size_max
+            row_group_size = max(row_group_size, row_group_size_min)
+            row_group_size = min(row_group_size, row_group_size_max)
 
         # write to Parquet file
         data_frame = pd.DataFrame(data=data)
@@ -252,4 +286,53 @@ class Buffer:
             f"Successfully persist file {file_path}, total size: {buffer_size},"
             f" row count: {buffer_row_count}, row group size: {row_group_size}"
         )
+        return [str(file_path)]
+
+    def _persist_csv(self, local_path: str, **kwargs):
+        sep = self._config.get("sep", ",")
+
+        header = list(self._buffer.keys())
+        data = []
+        data_count = len(next(iter(self._buffer.values())))
+        for i in range(data_count):
+            row = []
+            for name in header:
+                field_schema = self._fields[name]
+
+                # null is not supported yet
+                # convert to string
+                if field_schema.dtype in {
+                    DataType.JSON,
+                    DataType.ARRAY,
+                    DataType.SPARSE_FLOAT_VECTOR,
+                    DataType.BINARY_VECTOR,
+                    DataType.FLOAT_VECTOR,
+                }:
+                    row.append(json.dumps(self._buffer[name][i]))
+                elif field_schema.dtype in {DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR}:
+                    row.append(
+                        json.dumps(
+                            np.frombuffer(
+                                self._buffer[name][i],
+                                dtype=NUMPY_TYPE_CREATOR[field_schema.dtype.name],
+                            )
+                        )
+                    )
+                elif field_schema.dtype in {DataType.BOOL}:
+                    row.append("true" if self._buffer[name][i] else "false")
+                else:
+                    row.append(str(self._buffer[name][i]))
+            data.append(row)
+
+        rows = [header, *data]
+
+        file_path = Path(local_path + ".csv")
+        try:
+            with file_path.open("w", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter=sep)
+                writer.writerows(rows)
+        except Exception as e:
+            self._throw(f"Failed to persist file {file_path}, error: {e}")
+
+        logger.info(f"Successfully persist file {file_path}, row count: {len(rows)}")
         return [str(file_path)]

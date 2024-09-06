@@ -73,10 +73,8 @@ class Index:
         self._collection = collection
         self._field_name = field_name
         self._index_params = index_params
-        index_name = kwargs.get("index_name", Config.IndexName)
-        self._index_name = index_name
-        self._kwargs = kwargs
-        if self._kwargs.pop("construct_only", False):
+        self._index_name = kwargs.get("index_name", Config.IndexName)
+        if kwargs.get("construct_only", False):
             return
 
         conn = self._get_connection()
@@ -130,17 +128,11 @@ class Index:
             timeout(float, optional): An optional duration of time in seconds to allow
                 for the RPC. When timeout is set to None, client waits until server response
                 or error occur
-            kwargs:
-                * *index_name* (``str``) --
-                  The name of index. If no index is specified, the default index name is used.
         """
-        copy_kwargs = copy.deepcopy(kwargs)
-        index_name = copy_kwargs.pop("index_name", Config.IndexName)
         conn = self._get_connection()
         conn.drop_index(
             collection_name=self._collection.name,
             field_name=self.field_name,
-            index_name=index_name,
+            index_name=self.index_name,
             timeout=timeout,
-            **copy_kwargs,
         )

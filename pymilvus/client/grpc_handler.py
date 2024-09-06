@@ -42,6 +42,7 @@ from .types import (
     BulkInsertState,
     CompactionPlans,
     CompactionState,
+    DatabaseInfo,
     DataType,
     ExtraList,
     GrantInfo,
@@ -625,7 +626,6 @@ class GrpcHandler:
         entities: List,
         partition_name: Optional[str] = None,
         timeout: Optional[float] = None,
-        is_insert: bool = True,
         **kwargs,
     ):
         param = kwargs.get("upsert_param")
@@ -660,7 +660,7 @@ class GrpcHandler:
 
         try:
             request = self._prepare_batch_upsert_request(
-                collection_name, entities, partition_name, timeout, False, **kwargs
+                collection_name, entities, partition_name, timeout, **kwargs
             )
             rf = self._stub.Upsert.future(request, timeout=timeout)
             if kwargs.get("_async", False) is True:
@@ -1054,6 +1054,10 @@ class GrpcHandler:
             info_dict["index_name"] = response.index_descriptions[0].index_name
             if info_dict.get("params"):
                 info_dict["params"] = json.loads(info_dict["params"])
+            info_dict["total_rows"] = response.index_descriptions[0].total_rows
+            info_dict["indexed_rows"] = response.index_descriptions[0].indexed_rows
+            info_dict["pending_index_rows"] = response.index_descriptions[0].pending_index_rows
+            info_dict["state"] = common_pb2.IndexState.Name(response.index_descriptions[0].state)
             return info_dict
 
         raise AmbiguousIndexName(message=ExceptionsMessage.AmbiguousIndexName)
@@ -1073,6 +1077,7 @@ class GrpcHandler:
                 "total_rows": index_desc.total_rows,
                 "indexed_rows": index_desc.indexed_rows,
                 "pending_index_rows": index_desc.pending_index_rows,
+                "state": common_pb2.IndexState.Name(index_desc.state),
             }
         raise AmbiguousIndexName(message=ExceptionsMessage.AmbiguousIndexName)
 
@@ -1137,17 +1142,31 @@ class GrpcHandler:
         check_pass_param(
             collection_name=collection_name, replica_number=replica_number, timeout=timeout
         )
-        _refresh = kwargs.get("_refresh", False)
-        _resource_groups = kwargs.get("_resource_groups")
+        # leading _ is misused for keywork escape for `async`
+        # other params now support prefix _ or not
+        # params without leading "_" have higher priority
+        refresh = kwargs.get("refresh", kwargs.get("_refresh", False))
+        resource_groups = kwargs.get("resource_groups", kwargs.get("_resource_groups"))
+        load_fields = kwargs.get("load_fields", kwargs.get("_load_fields"))
+        skip_load_dynamic_field = kwargs.get(
+            "skip_load_dynamic_field", kwargs.get("_skip_load_dynamic_field", False)
+        )
+
         request = Prepare.load_collection(
-            "", collection_name, replica_number, _refresh, _resource_groups
+            "",
+            collection_name,
+            replica_number,
+            refresh,
+            resource_groups,
+            load_fields,
+            skip_load_dynamic_field,
         )
         rf = self._stub.LoadCollection.future(request, timeout=timeout)
         response = rf.result()
         check_status(response)
         _async = kwargs.get("_async", False)
         if not _async:
-            self.wait_for_loading_collection(collection_name, timeout, is_refresh=_refresh)
+            self.wait_for_loading_collection(collection_name, timeout, is_refresh=refresh)
 
     @retry_on_rpc_failure()
     def load_collection_progress(self, collection_name: str, timeout: Optional[float] = None):
@@ -1200,10 +1219,25 @@ class GrpcHandler:
             replica_number=replica_number,
             timeout=timeout,
         )
-        _refresh = kwargs.get("_refresh", False)
-        _resource_groups = kwargs.get("_resource_groups")
+        # leading _ is misused for keywork escape for `async`
+        # other params now support prefix _ or not
+        # params without leading "_" have higher priority
+        refresh = kwargs.get("refresh", kwargs.get("_refresh", False))
+        resource_groups = kwargs.get("resource_groups", kwargs.get("_resource_groups"))
+        load_fields = kwargs.get("load_fields", kwargs.get("_load_fields"))
+        skip_load_dynamic_field = kwargs.get(
+            "skip_load_dynamic_field", kwargs.get("_skip_load_dynamic_field", False)
+        )
+
         request = Prepare.load_partitions(
-            "", collection_name, partition_names, replica_number, _refresh, _resource_groups
+            "",
+            collection_name,
+            partition_names,
+            replica_number,
+            refresh,
+            resource_groups,
+            load_fields,
+            skip_load_dynamic_field,
         )
         future = self._stub.LoadPartitions.future(request, timeout=timeout)
 
@@ -1212,7 +1246,7 @@ class GrpcHandler:
             def _check():
                 if kwargs.get("sync", True):
                     self.wait_for_loading_partitions(
-                        collection_name, partition_names, is_refresh=_refresh
+                        collection_name, partition_names, is_refresh=refresh
                     )
 
             load_partitions_future = LoadPartitionsFuture(future)
@@ -1228,7 +1262,7 @@ class GrpcHandler:
         check_status(response)
         sync = kwargs.get("sync", True)
         if sync:
-            self.wait_for_loading_partitions(collection_name, partition_names, is_refresh=_refresh)
+            self.wait_for_loading_partitions(collection_name, partition_names, is_refresh=refresh)
             return None
         return None
 
@@ -1272,8 +1306,8 @@ class GrpcHandler:
         return response.progress
 
     @retry_on_rpc_failure()
-    def create_database(self, db_name: str, timeout: Optional[float] = None):
-        request = Prepare.create_database_req(db_name)
+    def create_database(self, db_name: str, timeout: Optional[float] = None, **kwargs):
+        request = Prepare.create_database_req(db_name, **kwargs)
         status = self._stub.CreateDatabase(request, timeout=timeout)
         check_status(status)
 
@@ -1289,6 +1323,21 @@ class GrpcHandler:
         response = self._stub.ListDatabases(request, timeout=timeout)
         check_status(response.status)
         return list(response.db_names)
+
+    @retry_on_rpc_failure()
+    def alter_database(
+        self, db_name: str, properties: dict, timeout: Optional[float] = None, **kwargs
+    ):
+        request = Prepare.alter_database_req(db_name, properties)
+        status = self._stub.AlterDatabase(request, timeout=timeout)
+        check_status(status)
+
+    @retry_on_rpc_failure()
+    def describe_database(self, db_name: str, timeout: Optional[float] = None):
+        request = Prepare.describe_database_req(db_name=db_name)
+        resp = self._stub.DescribeDatabase(request, timeout=timeout)
+        check_status(resp.status)
+        return DatabaseInfo(resp)
 
     @retry_on_rpc_failure()
     def get_load_state(
@@ -1528,8 +1577,8 @@ class GrpcHandler:
     def compact(
         self,
         collection_name: str,
+        is_clustering: Optional[bool] = False,
         timeout: Optional[float] = None,
-        is_major: Optional[bool] = False,
         **kwargs,
     ) -> int:
         request = Prepare.describe_collection_request(collection_name)
@@ -1537,7 +1586,7 @@ class GrpcHandler:
         response = rf.result()
         check_status(response.status)
 
-        req = Prepare.manual_compaction(response.collectionID, is_major)
+        req = Prepare.manual_compaction(response.collectionID, is_clustering)
         future = self._stub.ManualCompaction.future(req, timeout=timeout)
         response = future.result()
         check_status(response.status)

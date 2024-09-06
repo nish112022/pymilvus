@@ -51,8 +51,7 @@ def extend_batch_size(batch_size: int, next_param: dict, to_extend_batch_size: b
         extend_rate = DEFAULT_SEARCH_EXTENSION_RATE
     if EF in next_param[PARAMS]:
         real_batch = min(MAX_BATCH_SIZE, batch_size * extend_rate, next_param[PARAMS][EF])
-        if next_param[PARAMS][EF] > real_batch:
-            next_param[PARAMS][EF] = real_batch
+        next_param[PARAMS][EF] = min(next_param[PARAMS][EF], real_batch)
         return real_batch
     return min(MAX_BATCH_SIZE, batch_size * extend_rate)
 
@@ -92,7 +91,10 @@ class QueryIterator:
         self._kwargs[ITERATOR_FIELD] = "True"
 
     def __check_set_reduce_stop_for_best(self):
-        self._kwargs[REDUCE_STOP_FOR_BEST] = "True"
+        if self._kwargs.get(REDUCE_STOP_FOR_BEST, True):
+            self._kwargs[REDUCE_STOP_FOR_BEST] = "True"
+        else:
+            self._kwargs[REDUCE_STOP_FOR_BEST] = "False"
 
     def __check_set_batch_size(self, batch_size: int):
         if batch_size < 0:
@@ -102,7 +104,7 @@ class QueryIterator:
         self._kwargs[BATCH_SIZE] = batch_size
         self._kwargs[MILVUS_LIMIT] = batch_size
 
-    # rely on pk prop, so this method should be called after __set_up_expr
+    # rely on pk prop, so this method should be called after __setup__pk_prop
     def __set_up_expr(self, expr: str):
         if expr is not None:
             self._expr = expr
@@ -203,7 +205,7 @@ class QueryIterator:
             filtered_pk_str = f"{self._pk_field_name} > {self._next_id}"
         if current_expr is None or len(current_expr) == 0:
             return filtered_pk_str
-        return current_expr + " and " + filtered_pk_str
+        return "(" + current_expr + ")" + " and " + filtered_pk_str
 
     def __update_cursor(self, res: List) -> None:
         if len(res) == 0:
@@ -455,9 +457,7 @@ class SearchIterator:
 
     def __is_cache_enough(self, count: int) -> bool:
         cached_page = iterator_cache.fetch_cache(self._cache_id)
-        if cached_page is None or len(cached_page) < count:
-            return False
-        return True
+        return cached_page is not None and len(cached_page) >= count
 
     def __extract_page_from_cache(self, count: int) -> SearchPage:
         cached_page = iterator_cache.fetch_cache(self._cache_id)
@@ -572,7 +572,7 @@ class SearchIterator:
         if len(filtered_ids_str) > 0:
             if expr is not None and len(expr) > 0:
                 filter_expr = f" and {self._pk_field_name} not in [{filtered_ids_str}]"
-                return expr + filter_expr
+                return "(" + expr + ")" + filter_expr
             return f"{self._pk_field_name} not in [{filtered_ids_str}]"
         return expr
 

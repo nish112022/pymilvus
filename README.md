@@ -27,7 +27,7 @@ The following collection shows Milvus versions and recommended PyMilvus versions
 | 2.1.\* | 2.1.3 |
 | 2.2.\* | 2.2.15 |
 | 2.3.\* | 2.3.7 |
-| 2.4.\* | 2.4.0 |
+| 2.4.\* | 2.4.4 |
 
 
 ## Installation
@@ -37,12 +37,13 @@ You can install PyMilvus via `pip` or `pip3` for Python 3.8+:
 ```shell
 $ pip3 install pymilvus
 $ pip3 install pymilvus[model] # for milvus-model
+$ pip3 install pymilvus[bulk_writer] # for bulk_writer
 ```
 
 You can install a specific version of PyMilvus by:
 
 ```shell
-$ pip3 install pymilvus==2.3.7
+$ pip3 install pymilvus==2.4.4
 ```
 
 You can upgrade PyMilvus to the latest version by:
@@ -61,8 +62,6 @@ $ git submodule update --init
 ```
 
 Q2. How to generate python files from milvus-proto?
-
-**Before generating python files, please install requirements in `requirements.txt`**
 
 A2.
 ```shell
@@ -94,10 +93,10 @@ Q6. How to run unittests?
 
 A6
 ```shell
-$ pip install ".[test]"
+$ pip install ".[dev]"
 $ make unittest
 ```
-Q7. `zsh: no matches found: pymilvus[model]` in mac, how do I solve this?
+Q7. `zsh: no matches found: pymilvus[model]`, how do I solve this?
 
 A7
 ```shell

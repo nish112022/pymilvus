@@ -240,10 +240,6 @@ def traverse_rows_info(fields_info: Any, entities: List):
                     message=f"dynamic field enabled, {field_name} shouldn't in entities[{j}]"
                 )
 
-            value = entity.get(field_name, None)
-            if value is None:
-                raise ParamError(message=f"Field {field_name} don't match in entities[{j}]")
-
     # though impossible from sdk
     if primary_key_loc is None:
         raise ParamError(message="primary key not found")
@@ -263,6 +259,17 @@ def traverse_info(fields_info: Any):
         location[field["name"]] = i
 
     return location, primary_key_loc, auto_id_loc
+
+
+def traverse_upsert_info(fields_info: Any):
+    location, primary_key_loc = {}, None
+    for i, field in enumerate(fields_info):
+        if field.get("is_primary", False):
+            primary_key_loc = i
+
+        location[field["name"]] = i
+
+    return location, primary_key_loc
 
 
 def get_server_type(host: str):

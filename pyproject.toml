@@ -17,21 +17,24 @@ requires-python = '>=3.8'
 description = "Python Sdk for Milvus"
 readme = "README.md"
 dependencies=[
-    "setuptools >= 67", # python3.12 pkg_resources
-    "grpcio>=1.49.1,<=1.60.0",
+    "setuptools>69",
+    "setuptools<70.1;python_version<='3.8'",
+    "grpcio>=1.49.1",
     "protobuf>=3.20.0",
     "environs<=9.5.0",
     "ujson>=2.0.0",
     "pandas>=1.2.4",
     "numpy<1.25.0;python_version<='3.8'",
-    "requests",
-    "minio>=7.0.0",
-    "pyarrow>=12.0.0",
-    "azure-storage-blob",
+    "milvus-lite>=2.4.0;sys_platform!='win32'",
 ]
 
 classifiers=[
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: Apache Software License",
 ]
 
@@ -41,16 +44,27 @@ dynamic = ["version"]
 "repository" = 'https://github.com/milvus-io/pymilvus'
 
 [project.optional-dependencies]
+bulk_writer = [
+    "requests",
+    "minio>=7.0.0",
+    "pyarrow>=12.0.0",
+    "azure-storage-blob",
+]
+
 model = [
     "milvus-model>=0.1.0",
 ]
 
-test = [
+dev = [
+    # The generated codes of 1.63.0 is incompatible with versions < 1.63.0,
+    # so we use fixed grpcio version to develop.
+    "grpcio==1.62.2",
+    "grpcio-tools==1.62.2",
+    "grpcio-testing==1.62.2",
     "pytest>=5.3.4",
     "pytest-cov>=2.8.1",
     "pytest-timeout>=1.3.4",
-    "grpcio-testing",
-    "ruff>=0.3.3",
+    "ruff>0.4.0",
     "black",
 ]
 
@@ -112,6 +126,7 @@ lint.ignore = [
     "PLR0915", # To many statements TODO
     "C901", # TODO
     "PYI041", # TODO
+    "E402",
 ]
 
 # Allow autofix for all enabled rules (when `--fix`) is provided.
